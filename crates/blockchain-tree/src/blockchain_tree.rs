@@ -2,6 +2,7 @@
 use crate::{
     canonical_chain::CanonicalChain,
     chain::{BlockChainId, BlockKind},
+    metrics::TreeMetrics,
     AppendableChain, BlockBuffer, BlockIndices, BlockchainTreeConfig, PostStateData, TreeExternals,
 };
 use reth_db::{cursor::DbCursorRO, database::Database, tables, transaction::DbTx};
@@ -15,8 +16,8 @@ use reth_interfaces::{
     Error,
 };
 use reth_primitives::{
-    BlockHash, BlockNumHash, BlockNumber, ForkBlock, Hardfork, SealedBlock, SealedBlockWithSenders,
-    SealedHeader, U256,
+    BlockHash, BlockNumHash, BlockNumber, ForkBlock, Hardfork, Receipt, SealedBlock,
+    SealedBlockWithSenders, SealedHeader, U256,
 };
 use reth_provider::{
     chain::{ChainSplit, SplitAt},
@@ -87,6 +88,8 @@ pub struct BlockchainTree<DB: Database, C: Consensus, EF: ExecutorFactory> {
     config: BlockchainTreeConfig,
     /// Broadcast channel for canon state changes notifications.
     canon_state_notification_sender: CanonStateNotificationSender,
+    /// Metrics for the blockchain tree.
+    metrics: TreeMetrics,
 }
 
 /// A container that wraps chains and block indices to allow searching for block hashes across all
@@ -137,6 +140,7 @@ impl<DB: Database, C: Consensus, EF: ExecutorFactory> BlockchainTree<DB, C, EF> 
             ),
             config,
             canon_state_notification_sender,
+            metrics: Default::default(),
         })
     }
 
@@ -211,6 +215,15 @@ impl<DB: Database, C: Consensus, EF: ExecutorFactory> BlockchainTree<DB, C, EF> 
         let id = self.block_indices.get_blocks_chain_id(&block_hash)?;
         let chain = self.chains.get(&id)?;
         chain.block(block_hash)
+    }
+
+    /// Returns the block's receipts with matching hash from any side-chain.
+    ///
+    /// Caution: This will not return blocks from the canonical chain.
+    pub fn receipts_by_block_hash(&self, block_hash: BlockHash) -> Option<&[Receipt]> {
+        let id = self.block_indices.get_blocks_chain_id(&block_hash)?;
+        let chain = self.chains.get(&id)?;
+        chain.receipts_by_block_hash(block_hash)
     }
 
     /// Returns true if the block is included in a side-chain.
@@ -1057,6 +1070,12 @@ impl<DB: Database, C: Consensus, EF: ExecutorFactory> BlockchainTree<DB, C, EF> 
         } else {
             Ok(Some(Chain::new(blocks_and_execution)))
         }
+    }
+
+    /// Update blockchain tree metrics
+    pub(crate) fn update_tree_metrics(&self) {
+        self.metrics.sidechains.set(self.chains.len() as f64);
+        self.metrics.canonical_chain_height.set(self.canonical_chain().tip().number as f64);
     }
 }
 
