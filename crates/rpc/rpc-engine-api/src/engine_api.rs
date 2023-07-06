@@ -5,7 +5,7 @@ use reth_beacon_consensus::BeaconConsensusEngineHandle;
 use reth_interfaces::consensus::ForkchoiceState;
 use reth_payload_builder::PayloadStore;
 use reth_primitives::{BlockHash, BlockHashOrNumber, BlockNumber, ChainSpec, Hardfork, U64};
-use reth_provider::{BlockProvider, EvmEnvProvider, HeaderProvider, StateProviderFactory};
+use reth_provider::{BlockReader, EvmEnvProvider, HeaderProvider, StateProviderFactory};
 use reth_rpc_api::EngineApiServer;
 use reth_rpc_types::engine::{
     ExecutionPayload, ExecutionPayloadBodies, ExecutionPayloadEnvelope, ForkchoiceUpdated,
@@ -36,7 +36,7 @@ pub struct EngineApi<Provider> {
 
 impl<Provider> EngineApi<Provider>
 where
-    Provider: HeaderProvider + BlockProvider + StateProviderFactory + EvmEnvProvider + 'static,
+    Provider: HeaderProvider + BlockReader + StateProviderFactory + EvmEnvProvider + 'static,
 {
     /// Create new instance of [EngineApi].
     pub fn new(
@@ -304,7 +304,7 @@ where
 #[async_trait]
 impl<Provider> EngineApiServer for EngineApi<Provider>
 where
-    Provider: HeaderProvider + BlockProvider + StateProviderFactory + EvmEnvProvider + 'static,
+    Provider: HeaderProvider + BlockReader + StateProviderFactory + EvmEnvProvider + 'static,
 {
     /// Handler for `engine_newPayloadV1`
     /// See also <https://github.com/ethereum/execution-apis/blob/3d627c95a4d3510a8187dd02e0250ecb4331d27e/src/engine/paris.md#engine_newpayloadv1>
@@ -314,10 +314,10 @@ where
         Ok(EngineApi::new_payload_v1(self, payload).await?)
     }
 
-    /// Handler for `engine_newPayloadV1`
+    /// Handler for `engine_newPayloadV2`
     /// See also <https://github.com/ethereum/execution-apis/blob/3d627c95a4d3510a8187dd02e0250ecb4331d27e/src/engine/shanghai.md#engine_newpayloadv2>
     async fn new_payload_v2(&self, payload: ExecutionPayload) -> RpcResult<PayloadStatus> {
-        trace!(target: "rpc::engine", "Serving engine_newPayloadV1");
+        trace!(target: "rpc::engine", "Serving engine_newPayloadV2");
         Ok(EngineApi::new_payload_v2(self, payload).await?)
     }
 

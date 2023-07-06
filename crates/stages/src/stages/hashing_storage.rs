@@ -54,7 +54,7 @@ impl<DB: Database> Stage<DB> for StorageHashingStage {
     /// Execute the stage.
     async fn execute(
         &mut self,
-        provider: &mut DatabaseProviderRW<'_, &DB>,
+        provider: &DatabaseProviderRW<'_, &DB>,
         input: ExecInput,
     ) -> Result<ExecOutput, StageError> {
         let tx = provider.tx_ref();
@@ -176,7 +176,7 @@ impl<DB: Database> Stage<DB> for StorageHashingStage {
             // Assumption we are okay with is that plain state represent
             // `previous_stage_progress` state.
             let storages = provider.plainstate_storages(lists)?;
-            provider.insert_storage_for_hashing(storages.into_iter())?;
+            provider.insert_storage_for_hashing(storages)?;
         }
 
         // We finished the hashing stage, no future iterations is expected for the same block range,
@@ -193,7 +193,7 @@ impl<DB: Database> Stage<DB> for StorageHashingStage {
     /// Unwind the stage.
     async fn unwind(
         &mut self,
-        provider: &mut DatabaseProviderRW<'_, &DB>,
+        provider: &DatabaseProviderRW<'_, &DB>,
         input: UnwindInput,
     ) -> Result<UnwindOutput, StageError> {
         let (range, unwind_progress, _) =
@@ -233,7 +233,6 @@ mod tests {
     use rand::Rng;
     use reth_db::{
         cursor::{DbCursorRO, DbCursorRW},
-        mdbx::{tx::Tx, WriteMap, RW},
         models::{BlockNumberAddress, StoredBlockBodyIndices},
     };
     use reth_interfaces::test_utils::{
@@ -621,9 +620,9 @@ mod tests {
                 .map_err(|e| e.into())
         }
 
-        fn insert_storage_entry(
+        fn insert_storage_entry<'a, TX: DbTxMut<'a>>(
             &self,
-            tx: &Tx<'_, RW, WriteMap>,
+            tx: &'a TX,
             tid_address: BlockNumberAddress,
             entry: StorageEntry,
             hash: bool,

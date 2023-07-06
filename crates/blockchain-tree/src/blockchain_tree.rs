@@ -22,10 +22,11 @@ use reth_primitives::{
 use reth_provider::{
     chain::{ChainSplit, SplitAt},
     post_state::PostState,
-    BlockNumProvider, CanonStateNotification, CanonStateNotificationSender,
-    CanonStateNotifications, Chain, DatabaseProvider, DisplayBlocksChain, ExecutorFactory,
-    HeaderProvider,
+    BlockExecutionWriter, BlockNumReader, BlockWriter, CanonStateNotification,
+    CanonStateNotificationSender, CanonStateNotifications, Chain, DatabaseProvider,
+    DisplayBlocksChain, ExecutorFactory, HeaderProvider,
 };
+use reth_stages::{MetricEvent, MetricEventsSender};
 use std::{
     collections::{BTreeMap, HashMap},
     sync::Arc,
@@ -90,6 +91,8 @@ pub struct BlockchainTree<DB: Database, C: Consensus, EF: ExecutorFactory> {
     canon_state_notification_sender: CanonStateNotificationSender,
     /// Metrics for the blockchain tree.
     metrics: TreeMetrics,
+    /// Metrics for sync stages.
+    sync_metrics_tx: Option<MetricEventsSender>,
 }
 
 /// A container that wraps chains and block indices to allow searching for block hashes across all
@@ -136,12 +139,19 @@ impl<DB: Database, C: Consensus, EF: ExecutorFactory> BlockchainTree<DB, C, EF> 
             chains: Default::default(),
             block_indices: BlockIndices::new(
                 last_finalized_block_number,
-                BTreeMap::from_iter(last_canonical_hashes.into_iter()),
+                BTreeMap::from_iter(last_canonical_hashes),
             ),
             config,
             canon_state_notification_sender,
             metrics: Default::default(),
+            sync_metrics_tx: None,
         })
+    }
+
+    /// Set the sync metric events sender.
+    pub fn with_sync_metrics_tx(mut self, metrics_tx: MetricEventsSender) -> Self {
+        self.sync_metrics_tx = Some(metrics_tx);
+        self
     }
 
     /// Check if then block is known to blockchain tree or database and return its status.
@@ -264,7 +274,7 @@ impl<DB: Database, C: Consensus, EF: ExecutorFactory> BlockchainTree<DB, C, EF> 
                 .iter()
                 .filter(|&(key, _)| key < first_pending_block_number)
                 .collect::<Vec<_>>();
-            parent_block_hashed.extend(canonical_chain.into_iter());
+            parent_block_hashed.extend(canonical_chain);
 
             // get canonical fork.
             let canonical_fork = self.canonical_fork(chain_id)?;
@@ -592,7 +602,7 @@ impl<DB: Database, C: Consensus, EF: ExecutorFactory> BlockchainTree<DB, C, EF> 
     }
 
     /// Checks the block buffer for the given block.
-    pub fn get_buffered_block(&mut self, hash: &BlockHash) -> Option<&SealedBlockWithSenders> {
+    pub fn get_buffered_block(&self, hash: &BlockHash) -> Option<&SealedBlockWithSenders> {
         self.buffered_blocks.block_by_hash(hash)
     }
 
@@ -903,7 +913,9 @@ impl<DB: Database, C: Consensus, EF: ExecutorFactory> BlockchainTree<DB, C, EF> 
         let Some(chain_id) = self.block_indices.get_blocks_chain_id(block_hash) else {
             warn!(target: "blockchain_tree", ?block_hash,  "Block hash not found in block indices");
             // TODO: better error
-            return Err(BlockExecutionError::BlockHashNotFoundInChain { block_hash: *block_hash }.into())
+            return Err(
+                BlockExecutionError::BlockHashNotFoundInChain { block_hash: *block_hash }.into()
+            )
         };
         let chain = self.chains.remove(&chain_id).expect("To be present");
 
@@ -1008,8 +1020,8 @@ impl<DB: Database, C: Consensus, EF: ExecutorFactory> BlockchainTree<DB, C, EF> 
     }
 
     /// Canonicalize the given chain and commit it to the database.
-    fn commit_canonical(&mut self, chain: Chain) -> Result<(), Error> {
-        let mut provider = DatabaseProvider::new_rw(
+    fn commit_canonical(&self, chain: Chain) -> Result<(), Error> {
+        let provider = DatabaseProvider::new_rw(
             self.externals.db.tx_mut()?,
             self.externals.chain_spec.clone(),
         );
@@ -1072,10 +1084,15 @@ impl<DB: Database, C: Consensus, EF: ExecutorFactory> BlockchainTree<DB, C, EF> 
         }
     }
 
-    /// Update blockchain tree metrics
-    pub(crate) fn update_tree_metrics(&self) {
+    /// Update blockchain tree and sync metrics
+    pub(crate) fn update_metrics(&mut self) {
+        let height = self.canonical_chain().tip().number;
+
         self.metrics.sidechains.set(self.chains.len() as f64);
-        self.metrics.canonical_chain_height.set(self.canonical_chain().tip().number as f64);
+        self.metrics.canonical_chain_height.set(height as f64);
+        if let Some(metrics_tx) = self.sync_metrics_tx.as_mut() {
+            let _ = metrics_tx.send(MetricEvent::SyncHeight { height });
+        }
     }
 }
 
@@ -1085,24 +1102,21 @@ mod tests {
     use crate::block_buffer::BufferedBlocks;
     use assert_matches::assert_matches;
     use linked_hash_set::LinkedHashSet;
-    use reth_db::{
-        mdbx::{test_utils::create_test_rw_db, Env, WriteMap},
-        transaction::DbTxMut,
-    };
+    use reth_db::{test_utils::create_test_rw_db, transaction::DbTxMut, DatabaseEnv};
     use reth_interfaces::test_utils::TestConsensus;
     use reth_primitives::{
         proofs::EMPTY_ROOT, stage::StageCheckpoint, ChainSpecBuilder, H256, MAINNET,
     };
     use reth_provider::{
-        insert_block,
         post_state::PostState,
         test_utils::{blocks::BlockChainTestData, TestExecutorFactory},
+        BlockWriter, ProviderFactory,
     };
     use std::{collections::HashSet, sync::Arc};
 
     fn setup_externals(
         exec_res: Vec<PostState>,
-    ) -> TreeExternals<Arc<Env<WriteMap>>, Arc<TestConsensus>, TestExecutorFactory> {
+    ) -> TreeExternals<Arc<DatabaseEnv>, Arc<TestConsensus>, TestExecutorFactory> {
         let db = create_test_rw_db();
         let consensus = Arc::new(TestConsensus::default());
         let chain_spec = Arc::new(
@@ -1123,16 +1137,23 @@ mod tests {
 
         genesis.header.header.number = 10;
         genesis.header.header.state_root = EMPTY_ROOT;
-        let tx_mut = db.tx_mut().unwrap();
+        let factory = ProviderFactory::new(&db, MAINNET.clone());
+        let provider = factory.provider_rw().unwrap();
 
-        insert_block(&tx_mut, genesis, None).unwrap();
+        provider.insert_block(genesis, None).unwrap();
 
         // insert first 10 blocks
         for i in 0..10 {
-            tx_mut.put::<tables::CanonicalHeaders>(i, H256([100 + i as u8; 32])).unwrap();
+            provider
+                .tx_ref()
+                .put::<tables::CanonicalHeaders>(i, H256([100 + i as u8; 32]))
+                .unwrap();
         }
-        tx_mut.put::<tables::SyncStage>("Finish".to_string(), StageCheckpoint::new(10)).unwrap();
-        tx_mut.commit().unwrap();
+        provider
+            .tx_ref()
+            .put::<tables::SyncStage>("Finish".to_string(), StageCheckpoint::new(10))
+            .unwrap();
+        provider.commit().unwrap();
     }
 
     /// Test data structure that will check tree internals

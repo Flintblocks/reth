@@ -1,4 +1,7 @@
-use crate::{ExecInput, ExecOutput, Stage, StageError, UnwindInput, UnwindOutput};
+use crate::{
+    ExecInput, ExecOutput, MetricEvent, MetricEventsSender, Stage, StageError, UnwindInput,
+    UnwindOutput,
+};
 use reth_db::{
     cursor::{DbCursorRO, DbCursorRW, DbDupCursorRO},
     database::Database,
@@ -7,31 +10,18 @@ use reth_db::{
     transaction::{DbTx, DbTxMut},
 };
 use reth_interfaces::db::DatabaseError;
-use reth_metrics::{
-    metrics::{self, Gauge},
-    Metrics,
-};
 use reth_primitives::{
-    constants::MGAS_TO_GAS,
     stage::{
         CheckpointBlockRange, EntitiesCheckpoint, ExecutionCheckpoint, StageCheckpoint, StageId,
     },
     BlockNumber, Header, U256,
 };
 use reth_provider::{
-    post_state::PostState, BlockExecutor, BlockProvider, DatabaseProviderRW, ExecutorFactory,
+    post_state::PostState, BlockExecutor, BlockReader, DatabaseProviderRW, ExecutorFactory,
     HeaderProvider, LatestStateProviderRef, ProviderError,
 };
 use std::{ops::RangeInclusive, time::Instant};
 use tracing::*;
-
-/// Execution stage metrics.
-#[derive(Metrics)]
-#[metrics(scope = "sync.execution")]
-pub struct ExecutionStageMetrics {
-    /// The total amount of gas processed (in millions)
-    mgas_processed_total: Gauge,
-}
 
 /// The execution stage executes all transactions and
 /// update history indexes.
@@ -64,7 +54,7 @@ pub struct ExecutionStageMetrics {
 // false positive, we cannot derive it if !DB: Debug.
 #[allow(missing_debug_implementations)]
 pub struct ExecutionStage<EF: ExecutorFactory> {
-    metrics: ExecutionStageMetrics,
+    metrics_tx: Option<MetricEventsSender>,
     /// The stage's internal executor
     executor_factory: EF,
     /// The commit thresholds of the execution stage.
@@ -74,7 +64,7 @@ pub struct ExecutionStage<EF: ExecutorFactory> {
 impl<EF: ExecutorFactory> ExecutionStage<EF> {
     /// Create new execution stage with specified config.
     pub fn new(executor_factory: EF, thresholds: ExecutionStageThresholds) -> Self {
-        Self { metrics: ExecutionStageMetrics::default(), executor_factory, thresholds }
+        Self { metrics_tx: None, executor_factory, thresholds }
     }
 
     /// Create an execution stage with the provided  executor factory.
@@ -84,10 +74,16 @@ impl<EF: ExecutorFactory> ExecutionStage<EF> {
         Self::new(executor_factory, ExecutionStageThresholds::default())
     }
 
+    /// Set the metric events sender.
+    pub fn with_metrics_tx(mut self, metrics_tx: MetricEventsSender) -> Self {
+        self.metrics_tx = Some(metrics_tx);
+        self
+    }
+
     /// Execute the stage.
     pub fn execute_inner<DB: Database>(
-        &self,
-        provider: &mut DatabaseProviderRW<'_, &DB>,
+        &mut self,
+        provider: &DatabaseProviderRW<'_, &DB>,
         input: ExecInput,
     ) -> Result<ExecOutput, StageError> {
         if input.target_reached() {
@@ -129,9 +125,10 @@ impl<EF: ExecutorFactory> ExecutionStage<EF> {
                 })?;
 
             // Gas metrics
-            self.metrics
-                .mgas_processed_total
-                .increment(block.header.gas_used as f64 / MGAS_TO_GAS as f64);
+            if let Some(metrics_tx) = &mut self.metrics_tx {
+                let _ =
+                    metrics_tx.send(MetricEvent::ExecutionStageGas { gas: block.header.gas_used });
+            }
 
             // Merge state changes
             state.extend(block_state);
@@ -262,7 +259,7 @@ impl<EF: ExecutorFactory, DB: Database> Stage<DB> for ExecutionStage<EF> {
     /// Execute the stage
     async fn execute(
         &mut self,
-        provider: &mut DatabaseProviderRW<'_, &DB>,
+        provider: &DatabaseProviderRW<'_, &DB>,
         input: ExecInput,
     ) -> Result<ExecOutput, StageError> {
         // For Ethereum transactions that reaches the max call depth (1024) revm can use more stack
@@ -289,7 +286,7 @@ impl<EF: ExecutorFactory, DB: Database> Stage<DB> for ExecutionStage<EF> {
     /// Unwind the stage.
     async fn unwind(
         &mut self,
-        provider: &mut DatabaseProviderRW<'_, &DB>,
+        provider: &DatabaseProviderRW<'_, &DB>,
         input: UnwindInput,
     ) -> Result<UnwindOutput, StageError> {
         let tx = provider.tx_ref();
@@ -353,7 +350,10 @@ impl<EF: ExecutorFactory, DB: Database> Stage<DB> for ExecutionStage<EF> {
         }
 
         // Look up the start index for the transaction range
-        let first_tx_num = provider.block_body_indices(*range.start())?.first_tx_num();
+        let first_tx_num = provider
+            .block_body_indices(*range.start())?
+            .ok_or(ProviderError::BlockBodyIndicesNotFound(*range.start()))?
+            .first_tx_num();
 
         let mut stage_checkpoint = input.checkpoint.execution_stage_checkpoint();
 
@@ -414,15 +414,12 @@ mod tests {
     use super::*;
     use crate::test_utils::TestTransaction;
     use assert_matches::assert_matches;
-    use reth_db::{
-        mdbx::{test_utils::create_test_db, EnvKind, WriteMap},
-        models::AccountBeforeTx,
-    };
+    use reth_db::{models::AccountBeforeTx, test_utils::create_test_rw_db};
     use reth_primitives::{
         hex_literal::hex, keccak256, stage::StageUnitCheckpoint, Account, Bytecode,
         ChainSpecBuilder, SealedBlock, StorageEntry, H160, H256, MAINNET, U256,
     };
-    use reth_provider::{insert_canonical_block, AccountReader, ProviderFactory, ReceiptProvider};
+    use reth_provider::{AccountReader, BlockWriter, ProviderFactory, ReceiptProvider};
     use reth_revm::Factory;
     use reth_rlp::Decodable;
     use std::sync::Arc;
@@ -438,7 +435,7 @@ mod tests {
 
     #[test]
     fn execution_checkpoint_matches() {
-        let state_db = create_test_db::<WriteMap>(EnvKind::RW);
+        let state_db = create_test_rw_db();
         let factory = ProviderFactory::new(state_db.as_ref(), MAINNET.clone());
         let tx = factory.provider_rw().unwrap();
 
@@ -463,16 +460,16 @@ mod tests {
 
     #[test]
     fn execution_checkpoint_precedes() {
-        let state_db = create_test_db::<WriteMap>(EnvKind::RW);
+        let state_db = create_test_rw_db();
         let factory = ProviderFactory::new(state_db.as_ref(), MAINNET.clone());
-        let mut provider = factory.provider_rw().unwrap();
+        let provider = factory.provider_rw().unwrap();
 
         let mut genesis_rlp = hex!("f901faf901f5a00000000000000000000000000000000000000000000000000000000000000000a01dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347942adc25665018aa1fe0e6bc666dac8fc2697ff9baa045571b40ae66ca7480791bbb2887286e4e4c4b1b298b191c889d6959023a32eda056e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421a056e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421b901000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000083020000808502540be400808000a00000000000000000000000000000000000000000000000000000000000000000880000000000000000c0c0").as_slice();
         let genesis = SealedBlock::decode(&mut genesis_rlp).unwrap();
         let mut block_rlp = hex!("f90262f901f9a075c371ba45999d87f4542326910a11af515897aebce5265d3f6acd1f1161f82fa01dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347942adc25665018aa1fe0e6bc666dac8fc2697ff9baa098f2dcd87c8ae4083e7017a05456c14eea4b1db2032126e27b3b1563d57d7cc0a08151d548273f6683169524b66ca9fe338b9ce42bc3540046c828fd939ae23bcba03f4e5c2ec5b2170b711d97ee755c160457bb58d8daa338e835ec02ae6860bbabb901000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000083020000018502540be40082a8798203e800a00000000000000000000000000000000000000000000000000000000000000000880000000000000000f863f861800a8405f5e10094100000000000000000000000000000000000000080801ba07e09e26678ed4fac08a249ebe8ed680bf9051a5e14ad223e4b2b9d26e0208f37a05f6e3f188e3e6eab7d7d3b6568f5eac7d687b08d307d3154ccd8c87b4630509bc0").as_slice();
         let block = SealedBlock::decode(&mut block_rlp).unwrap();
-        insert_canonical_block(provider.tx_mut(), genesis, None).unwrap();
-        insert_canonical_block(provider.tx_mut(), block.clone(), None).unwrap();
+        provider.insert_block(genesis, None).unwrap();
+        provider.insert_block(block.clone(), None).unwrap();
         provider.commit().unwrap();
 
         let previous_stage_checkpoint = ExecutionCheckpoint {
@@ -499,16 +496,16 @@ mod tests {
 
     #[test]
     fn execution_checkpoint_recalculate_full_previous_some() {
-        let state_db = create_test_db::<WriteMap>(EnvKind::RW);
+        let state_db = create_test_rw_db();
         let factory = ProviderFactory::new(state_db.as_ref(), MAINNET.clone());
-        let mut provider = factory.provider_rw().unwrap();
+        let provider = factory.provider_rw().unwrap();
 
         let mut genesis_rlp = hex!("f901faf901f5a00000000000000000000000000000000000000000000000000000000000000000a01dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347942adc25665018aa1fe0e6bc666dac8fc2697ff9baa045571b40ae66ca7480791bbb2887286e4e4c4b1b298b191c889d6959023a32eda056e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421a056e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421b901000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000083020000808502540be400808000a00000000000000000000000000000000000000000000000000000000000000000880000000000000000c0c0").as_slice();
         let genesis = SealedBlock::decode(&mut genesis_rlp).unwrap();
         let mut block_rlp = hex!("f90262f901f9a075c371ba45999d87f4542326910a11af515897aebce5265d3f6acd1f1161f82fa01dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347942adc25665018aa1fe0e6bc666dac8fc2697ff9baa098f2dcd87c8ae4083e7017a05456c14eea4b1db2032126e27b3b1563d57d7cc0a08151d548273f6683169524b66ca9fe338b9ce42bc3540046c828fd939ae23bcba03f4e5c2ec5b2170b711d97ee755c160457bb58d8daa338e835ec02ae6860bbabb901000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000083020000018502540be40082a8798203e800a00000000000000000000000000000000000000000000000000000000000000000880000000000000000f863f861800a8405f5e10094100000000000000000000000000000000000000080801ba07e09e26678ed4fac08a249ebe8ed680bf9051a5e14ad223e4b2b9d26e0208f37a05f6e3f188e3e6eab7d7d3b6568f5eac7d687b08d307d3154ccd8c87b4630509bc0").as_slice();
         let block = SealedBlock::decode(&mut block_rlp).unwrap();
-        insert_canonical_block(provider.tx_mut(), genesis, None).unwrap();
-        insert_canonical_block(provider.tx_mut(), block.clone(), None).unwrap();
+        provider.insert_block(genesis, None).unwrap();
+        provider.insert_block(block.clone(), None).unwrap();
         provider.commit().unwrap();
 
         let previous_stage_checkpoint = ExecutionCheckpoint {
@@ -535,16 +532,16 @@ mod tests {
 
     #[test]
     fn execution_checkpoint_recalculate_full_previous_none() {
-        let state_db = create_test_db::<WriteMap>(EnvKind::RW);
+        let state_db = create_test_rw_db();
         let factory = ProviderFactory::new(state_db.as_ref(), MAINNET.clone());
-        let mut provider = factory.provider_rw().unwrap();
+        let provider = factory.provider_rw().unwrap();
 
         let mut genesis_rlp = hex!("f901faf901f5a00000000000000000000000000000000000000000000000000000000000000000a01dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347942adc25665018aa1fe0e6bc666dac8fc2697ff9baa045571b40ae66ca7480791bbb2887286e4e4c4b1b298b191c889d6959023a32eda056e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421a056e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421b901000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000083020000808502540be400808000a00000000000000000000000000000000000000000000000000000000000000000880000000000000000c0c0").as_slice();
         let genesis = SealedBlock::decode(&mut genesis_rlp).unwrap();
         let mut block_rlp = hex!("f90262f901f9a075c371ba45999d87f4542326910a11af515897aebce5265d3f6acd1f1161f82fa01dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347942adc25665018aa1fe0e6bc666dac8fc2697ff9baa098f2dcd87c8ae4083e7017a05456c14eea4b1db2032126e27b3b1563d57d7cc0a08151d548273f6683169524b66ca9fe338b9ce42bc3540046c828fd939ae23bcba03f4e5c2ec5b2170b711d97ee755c160457bb58d8daa338e835ec02ae6860bbabb901000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000083020000018502540be40082a8798203e800a00000000000000000000000000000000000000000000000000000000000000000880000000000000000f863f861800a8405f5e10094100000000000000000000000000000000000000080801ba07e09e26678ed4fac08a249ebe8ed680bf9051a5e14ad223e4b2b9d26e0208f37a05f6e3f188e3e6eab7d7d3b6568f5eac7d687b08d307d3154ccd8c87b4630509bc0").as_slice();
         let block = SealedBlock::decode(&mut block_rlp).unwrap();
-        insert_canonical_block(provider.tx_mut(), genesis, None).unwrap();
-        insert_canonical_block(provider.tx_mut(), block.clone(), None).unwrap();
+        provider.insert_block(genesis, None).unwrap();
+        provider.insert_block(block.clone(), None).unwrap();
         provider.commit().unwrap();
 
         let previous_checkpoint = StageCheckpoint { block_number: 1, stage_checkpoint: None };
@@ -565,9 +562,9 @@ mod tests {
     async fn sanity_execution_of_block() {
         // TODO cleanup the setup after https://github.com/paradigmxyz/reth/issues/332
         // is merged as it has similar framework
-        let state_db = create_test_db::<WriteMap>(EnvKind::RW);
+        let state_db = create_test_rw_db();
         let factory = ProviderFactory::new(state_db.as_ref(), MAINNET.clone());
-        let mut provider = factory.provider_rw().unwrap();
+        let provider = factory.provider_rw().unwrap();
         let input = ExecInput {
             target: Some(1),
             /// The progress of this stage the last time it was executed.
@@ -577,13 +574,14 @@ mod tests {
         let genesis = SealedBlock::decode(&mut genesis_rlp).unwrap();
         let mut block_rlp = hex!("f90262f901f9a075c371ba45999d87f4542326910a11af515897aebce5265d3f6acd1f1161f82fa01dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347942adc25665018aa1fe0e6bc666dac8fc2697ff9baa098f2dcd87c8ae4083e7017a05456c14eea4b1db2032126e27b3b1563d57d7cc0a08151d548273f6683169524b66ca9fe338b9ce42bc3540046c828fd939ae23bcba03f4e5c2ec5b2170b711d97ee755c160457bb58d8daa338e835ec02ae6860bbabb901000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000083020000018502540be40082a8798203e800a00000000000000000000000000000000000000000000000000000000000000000880000000000000000f863f861800a8405f5e10094100000000000000000000000000000000000000080801ba07e09e26678ed4fac08a249ebe8ed680bf9051a5e14ad223e4b2b9d26e0208f37a05f6e3f188e3e6eab7d7d3b6568f5eac7d687b08d307d3154ccd8c87b4630509bc0").as_slice();
         let block = SealedBlock::decode(&mut block_rlp).unwrap();
-        insert_canonical_block(provider.tx_mut(), genesis, None).unwrap();
-        insert_canonical_block(provider.tx_mut(), block.clone(), None).unwrap();
+        provider.insert_block(genesis, None).unwrap();
+        provider.insert_block(block.clone(), None).unwrap();
         provider.commit().unwrap();
 
         // insert pre state
-        let mut provider = factory.provider_rw().unwrap();
-        let db_tx = provider.tx_mut();
+        let provider = factory.provider_rw().unwrap();
+
+        let db_tx = provider.tx_ref();
         let acc1 = H160(hex!("1000000000000000000000000000000000000000"));
         let acc2 = H160(hex!("a94f5374fce5edbc8e2a8697c15331677e6ebf0b"));
         let code = hex!("5a465a905090036002900360015500");
@@ -604,9 +602,9 @@ mod tests {
         db_tx.put::<tables::Bytecodes>(code_hash, Bytecode::new_raw(code.to_vec().into())).unwrap();
         provider.commit().unwrap();
 
-        let mut provider = factory.provider_rw().unwrap();
+        let provider = factory.provider_rw().unwrap();
         let mut execution_stage = stage();
-        let output = execution_stage.execute(&mut provider, input).await.unwrap();
+        let output = execution_stage.execute(&provider, input).await.unwrap();
         provider.commit().unwrap();
         assert_matches!(output, ExecOutput {
             checkpoint: StageCheckpoint {
@@ -674,9 +672,9 @@ mod tests {
         // TODO cleanup the setup after https://github.com/paradigmxyz/reth/issues/332
         // is merged as it has similar framework
 
-        let state_db = create_test_db::<WriteMap>(EnvKind::RW);
+        let state_db = create_test_rw_db();
         let factory = ProviderFactory::new(state_db.as_ref(), MAINNET.clone());
-        let mut provider = factory.provider_rw().unwrap();
+        let provider = factory.provider_rw().unwrap();
         let input = ExecInput {
             target: Some(1),
             /// The progress of this stage the last time it was executed.
@@ -686,8 +684,8 @@ mod tests {
         let genesis = SealedBlock::decode(&mut genesis_rlp).unwrap();
         let mut block_rlp = hex!("f90262f901f9a075c371ba45999d87f4542326910a11af515897aebce5265d3f6acd1f1161f82fa01dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347942adc25665018aa1fe0e6bc666dac8fc2697ff9baa098f2dcd87c8ae4083e7017a05456c14eea4b1db2032126e27b3b1563d57d7cc0a08151d548273f6683169524b66ca9fe338b9ce42bc3540046c828fd939ae23bcba03f4e5c2ec5b2170b711d97ee755c160457bb58d8daa338e835ec02ae6860bbabb901000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000083020000018502540be40082a8798203e800a00000000000000000000000000000000000000000000000000000000000000000880000000000000000f863f861800a8405f5e10094100000000000000000000000000000000000000080801ba07e09e26678ed4fac08a249ebe8ed680bf9051a5e14ad223e4b2b9d26e0208f37a05f6e3f188e3e6eab7d7d3b6568f5eac7d687b08d307d3154ccd8c87b4630509bc0").as_slice();
         let block = SealedBlock::decode(&mut block_rlp).unwrap();
-        insert_canonical_block(provider.tx_mut(), genesis, None).unwrap();
-        insert_canonical_block(provider.tx_mut(), block.clone(), None).unwrap();
+        provider.insert_block(genesis, None).unwrap();
+        provider.insert_block(block.clone(), None).unwrap();
         provider.commit().unwrap();
 
         // variables
@@ -695,8 +693,9 @@ mod tests {
         let balance = U256::from(0x3635c9adc5dea00000u128);
         let code_hash = keccak256(code);
         // pre state
-        let mut provider = factory.provider_rw().unwrap();
-        let db_tx = provider.tx_mut();
+        let provider = factory.provider_rw().unwrap();
+
+        let db_tx = provider.tx_ref();
         let acc1 = H160(hex!("1000000000000000000000000000000000000000"));
         let acc1_info = Account { nonce: 0, balance: U256::ZERO, bytecode_hash: Some(code_hash) };
         let acc2 = H160(hex!("a94f5374fce5edbc8e2a8697c15331677e6ebf0b"));
@@ -708,16 +707,16 @@ mod tests {
         provider.commit().unwrap();
 
         // execute
-        let mut provider = factory.provider_rw().unwrap();
+        let provider = factory.provider_rw().unwrap();
         let mut execution_stage = stage();
-        let result = execution_stage.execute(&mut provider, input).await.unwrap();
+        let result = execution_stage.execute(&provider, input).await.unwrap();
         provider.commit().unwrap();
 
-        let mut provider = factory.provider_rw().unwrap();
+        let provider = factory.provider_rw().unwrap();
         let mut stage = stage();
         let result = stage
             .unwind(
-                &mut provider,
+                &provider,
                 UnwindInput { checkpoint: result.checkpoint, unwind_to: 0, bad_block: None },
             )
             .await
@@ -753,7 +752,7 @@ mod tests {
     async fn test_selfdestruct() {
         let test_tx = TestTransaction::default();
         let factory = ProviderFactory::new(test_tx.tx.as_ref(), MAINNET.clone());
-        let mut provider = factory.provider_rw().unwrap();
+        let provider = factory.provider_rw().unwrap();
         let input = ExecInput {
             target: Some(1),
             /// The progress of this stage the last time it was executed.
@@ -763,8 +762,8 @@ mod tests {
         let genesis = SealedBlock::decode(&mut genesis_rlp).unwrap();
         let mut block_rlp = hex!("f9025ff901f7a0c86e8cc0310ae7c531c758678ddbfd16fc51c8cef8cec650b032de9869e8b94fa01dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347942adc25665018aa1fe0e6bc666dac8fc2697ff9baa050554882fbbda2c2fd93fdc466db9946ea262a67f7a76cc169e714f105ab583da00967f09ef1dfed20c0eacfaa94d5cd4002eda3242ac47eae68972d07b106d192a0e3c8b47fbfc94667ef4cceb17e5cc21e3b1eebd442cebb27f07562b33836290db90100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000008302000001830f42408238108203e800a00000000000000000000000000000000000000000000000000000000000000000880000000000000000f862f860800a83061a8094095e7baea6a6c7c4c2dfeb977efac326af552d8780801ba072ed817487b84ba367d15d2f039b5fc5f087d0a8882fbdf73e8cb49357e1ce30a0403d800545b8fc544f92ce8124e2255f8c3c6af93f28243a120585d4c4c6a2a3c0").as_slice();
         let block = SealedBlock::decode(&mut block_rlp).unwrap();
-        insert_canonical_block(provider.tx_mut(), genesis, None).unwrap();
-        insert_canonical_block(provider.tx_mut(), block.clone(), None).unwrap();
+        provider.insert_block(genesis, None).unwrap();
+        provider.insert_block(block.clone(), None).unwrap();
         provider.commit().unwrap();
 
         // variables
@@ -811,9 +810,9 @@ mod tests {
         provider.commit().unwrap();
 
         // execute
-        let mut provider = factory.provider_rw().unwrap();
+        let provider = factory.provider_rw().unwrap();
         let mut execution_stage = stage();
-        let _ = execution_stage.execute(&mut provider, input).await.unwrap();
+        let _ = execution_stage.execute(&provider, input).await.unwrap();
         provider.commit().unwrap();
 
         // assert unwind stage

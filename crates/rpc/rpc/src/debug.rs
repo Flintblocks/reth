@@ -2,7 +2,8 @@ use crate::{
     eth::{
         error::{EthApiError, EthResult},
         revm_utils::{
-            clone_into_empty_db, inspect, prepare_call_env, replay_transactions_until, EvmOverrides,
+            clone_into_empty_db, inspect, prepare_call_env, replay_transactions_until,
+            result_output, EvmOverrides,
         },
         EthTransactions, TransactionSource,
     },
@@ -12,7 +13,7 @@ use crate::{
 use async_trait::async_trait;
 use jsonrpsee::core::RpcResult;
 use reth_primitives::{Account, Block, BlockId, BlockNumberOrTag, Bytes, TransactionSigned, H256};
-use reth_provider::{BlockProviderIdExt, HeaderProvider, StateProviderBox};
+use reth_provider::{BlockReaderIdExt, HeaderProvider, StateProviderBox};
 use reth_revm::{
     database::{State, SubState},
     env::tx_env_with_recovered,
@@ -70,7 +71,7 @@ impl<Provider, Eth> DebugApi<Provider, Eth> {
 
 impl<Provider, Eth> DebugApi<Provider, Eth>
 where
-    Provider: BlockProviderIdExt + HeaderProvider + 'static,
+    Provider: BlockReaderIdExt + HeaderProvider + 'static,
     Eth: EthTransactions + 'static,
 {
     /// Executes the future on a new blocking task.
@@ -346,8 +347,8 @@ where
         let (res, _) =
             self.inner.eth_api.inspect_call_at(call, at, overrides, &mut inspector).await?;
         let gas_used = res.result.gas_used();
-
-        let frame = inspector.into_geth_builder().geth_traces(gas_used, config);
+        let return_value = result_output(&res.result).unwrap_or_default().into();
+        let frame = inspector.into_geth_builder().geth_traces(gas_used, return_value, config);
 
         Ok(frame.into())
     }
@@ -380,7 +381,8 @@ where
                             .map_err(|_| EthApiError::InvalidTracerConfig)?;
 
                         let mut inspector = TracingInspector::new(
-                            TracingInspectorConfig::from_geth_config(&config),
+                            TracingInspectorConfig::from_geth_config(&config)
+                                .set_record_logs(call_config.with_log.unwrap_or_default()),
                         );
 
                         let (res, _) = inspect(db, env, &mut inspector)?;
@@ -423,8 +425,8 @@ where
 
         let (res, _) = inspect(db, env, &mut inspector)?;
         let gas_used = res.result.gas_used();
-
-        let frame = inspector.into_geth_builder().geth_traces(gas_used, config);
+        let return_value = result_output(&res.result).unwrap_or_default().into();
+        let frame = inspector.into_geth_builder().geth_traces(gas_used, return_value, config);
 
         Ok((frame.into(), res.state))
     }
@@ -516,7 +518,7 @@ where
 #[async_trait]
 impl<Provider, Eth> DebugApiServer for DebugApi<Provider, Eth>
 where
-    Provider: BlockProviderIdExt + HeaderProvider + 'static,
+    Provider: BlockReaderIdExt + HeaderProvider + 'static,
     Eth: EthApiSpec + 'static,
 {
     /// Handler for `debug_getRawHeader`

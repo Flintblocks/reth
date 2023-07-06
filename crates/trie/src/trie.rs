@@ -1,7 +1,7 @@
 use crate::{
     account::EthAccount,
     hashed_cursor::{HashedAccountCursor, HashedCursorFactory, HashedStorageCursor},
-    prefix_set::{PrefixSet, PrefixSetLoader},
+    prefix_set::{PrefixSet, PrefixSetLoader, PrefixSetMut},
     progress::{IntermediateStateRootState, StateRootProgress},
     trie_cursor::{AccountTrieCursor, StorageTrieCursor},
     updates::{TrieKey, TrieOp, TrieUpdates},
@@ -90,7 +90,7 @@ where
     pub fn new(tx: &'a TX) -> Self {
         Self {
             tx,
-            changed_account_prefixes: PrefixSet::default(),
+            changed_account_prefixes: PrefixSetMut::default().freeze(),
             changed_storage_prefixes: HashMap::default(),
             previous_state: None,
             threshold: 100_000,
@@ -110,8 +110,10 @@ where
     ) -> Result<Self, StateRootError> {
         let (account_prefixes, storage_prefixes) = PrefixSetLoader::new(tx).load(range)?;
         Ok(Self::new(tx)
-            .with_changed_account_prefixes(account_prefixes)
-            .with_changed_storage_prefixes(storage_prefixes))
+            .with_changed_account_prefixes(account_prefixes.freeze())
+            .with_changed_storage_prefixes(
+                storage_prefixes.into_iter().map(|(k, v)| (k, v.freeze())).collect(),
+            ))
     }
 
     /// Computes the state root of the trie with the changed account and storage prefixes and
@@ -371,7 +373,7 @@ where
         Self {
             tx,
             hashed_address,
-            changed_prefixes: PrefixSet::default(),
+            changed_prefixes: PrefixSetMut::default().freeze(),
             hashed_cursor_factory: tx,
         }
     }
@@ -389,7 +391,12 @@ impl<'a, 'b, TX, H> StorageRoot<'a, 'b, TX, H> {
         hashed_cursor_factory: &'b H,
         hashed_address: H256,
     ) -> Self {
-        Self { tx, hashed_address, changed_prefixes: PrefixSet::default(), hashed_cursor_factory }
+        Self {
+            tx,
+            hashed_address,
+            changed_prefixes: PrefixSetMut::default().freeze(),
+            hashed_cursor_factory,
+        }
     }
 
     /// Set the changed prefixes.
@@ -514,9 +521,10 @@ mod tests {
     use proptest::{prelude::ProptestConfig, proptest};
     use reth_db::{
         cursor::{DbCursorRO, DbCursorRW, DbDupCursorRO},
-        mdbx::{test_utils::create_test_rw_db, Env, WriteMap},
         tables,
+        test_utils::create_test_rw_db,
         transaction::DbTxMut,
+        DatabaseEnv,
     };
     use reth_primitives::{
         hex_literal::hex,
@@ -529,7 +537,7 @@ mod tests {
     use std::{collections::BTreeMap, ops::Mul, str::FromStr};
 
     fn insert_account<'a, TX: DbTxMut<'a>>(
-        tx: &mut TX,
+        tx: &TX,
         address: Address,
         account: Account,
         storage: &BTreeMap<H256, U256>,
@@ -540,7 +548,7 @@ mod tests {
     }
 
     fn insert_storage<'a, TX: DbTxMut<'a>>(
-        tx: &mut TX,
+        tx: &TX,
         hashed_address: H256,
         storage: &BTreeMap<H256, U256>,
     ) {
@@ -556,7 +564,7 @@ mod tests {
     fn incremental_vs_full_root(inputs: &[&str], modified: &str) {
         let db = create_test_rw_db();
         let factory = ProviderFactory::new(db.as_ref(), MAINNET.clone());
-        let mut tx = factory.provider_rw().unwrap();
+        let tx = factory.provider_rw().unwrap();
         let hashed_address = H256::from_low_u64_be(1);
 
         let mut hashed_storage_cursor =
@@ -590,10 +598,10 @@ mod tests {
         trie_updates.flush(tx.tx_ref()).unwrap();
 
         // 3. Calculate the incremental root
-        let mut storage_changes = PrefixSet::default();
+        let mut storage_changes = PrefixSetMut::default();
         storage_changes.insert(Nibbles::unpack(modified_key));
-        let loader = StorageRoot::new_hashed(tx.tx_mut(), hashed_address)
-            .with_changed_prefixes(storage_changes);
+        let loader = StorageRoot::new_hashed(tx.tx_ref(), hashed_address)
+            .with_changed_prefixes(storage_changes.freeze());
         let incremental_root = loader.root().unwrap();
 
         assert_eq!(modified_root, incremental_root);
@@ -633,8 +641,8 @@ mod tests {
             }
             tx.commit().unwrap();
 
-            let mut tx =  factory.provider_rw().unwrap();
-            let got = StorageRoot::new(tx.tx_mut(), address).root().unwrap();
+            let tx =  factory.provider_rw().unwrap();
+            let got = StorageRoot::new(tx.tx_ref(), address).root().unwrap();
             let expected = storage_root(storage.into_iter());
             assert_eq!(expected, got);
         });
@@ -681,7 +689,7 @@ mod tests {
     fn test_empty_storage_root() {
         let db = create_test_rw_db();
         let factory = ProviderFactory::new(db.as_ref(), MAINNET.clone());
-        let mut tx = factory.provider_rw().unwrap();
+        let tx = factory.provider_rw().unwrap();
 
         let address = Address::random();
         let code = "el buen fla";
@@ -690,11 +698,11 @@ mod tests {
             balance: U256::from(414241124u32),
             bytecode_hash: Some(keccak256(code)),
         };
-        insert_account(tx.tx_mut(), address, account, &Default::default());
+        insert_account(tx.tx_ref(), address, account, &Default::default());
         tx.commit().unwrap();
 
-        let mut tx = factory.provider_rw().unwrap();
-        let got = StorageRoot::new(tx.tx_mut(), address).root().unwrap();
+        let tx = factory.provider_rw().unwrap();
+        let got = StorageRoot::new(tx.tx_ref(), address).root().unwrap();
         assert_eq!(got, EMPTY_ROOT);
     }
 
@@ -703,7 +711,7 @@ mod tests {
     fn test_storage_root() {
         let db = create_test_rw_db();
         let factory = ProviderFactory::new(db.as_ref(), MAINNET.clone());
-        let mut tx = factory.provider_rw().unwrap();
+        let tx = factory.provider_rw().unwrap();
 
         let address = Address::random();
         let storage = BTreeMap::from([
@@ -718,11 +726,11 @@ mod tests {
             bytecode_hash: Some(keccak256(code)),
         };
 
-        insert_account(tx.tx_mut(), address, account, &storage);
+        insert_account(tx.tx_ref(), address, account, &storage);
         tx.commit().unwrap();
 
-        let mut tx = factory.provider_rw().unwrap();
-        let got = StorageRoot::new(tx.tx_mut(), address).root().unwrap();
+        let tx = factory.provider_rw().unwrap();
+        let got = StorageRoot::new(tx.tx_ref(), address).root().unwrap();
 
         assert_eq!(storage_root(storage.into_iter()), got);
     }
@@ -747,13 +755,13 @@ mod tests {
 
                 let db = create_test_rw_db();
                 let factory = ProviderFactory::new(db.as_ref(), MAINNET.clone());
-                let mut tx = factory.provider_rw().unwrap();
+                let tx = factory.provider_rw().unwrap();
 
                 for (address, (account, storage)) in &state {
-                    insert_account(tx.tx_mut(), *address, *account, storage)
+                    insert_account(tx.tx_ref(), *address, *account, storage)
                 }
                 tx.commit().unwrap();
-                let mut tx =  factory.provider_rw().unwrap();
+                let tx =  factory.provider_rw().unwrap();
 
                 let expected = state_root(state.into_iter());
 
@@ -763,7 +771,7 @@ mod tests {
 
                 let mut intermediate_state: Option<Box<IntermediateStateRootState>> = None;
                 while got.is_none() {
-                    let calculator = StateRoot::new(tx.tx_mut())
+                    let calculator = StateRoot::new(tx.tx_ref())
                         .with_threshold(threshold)
                         .with_intermediate_state(intermediate_state.take().map(|state| *state));
                     match calculator.root_with_progress().unwrap() {
@@ -786,16 +794,16 @@ mod tests {
     fn test_state_root_with_state(state: State) {
         let db = create_test_rw_db();
         let factory = ProviderFactory::new(db.as_ref(), MAINNET.clone());
-        let mut tx = factory.provider_rw().unwrap();
+        let tx = factory.provider_rw().unwrap();
 
         for (address, (account, storage)) in &state {
-            insert_account(tx.tx_mut(), *address, *account, storage)
+            insert_account(tx.tx_ref(), *address, *account, storage)
         }
         tx.commit().unwrap();
         let expected = state_root(state.into_iter());
 
-        let mut tx = factory.provider_rw().unwrap();
-        let got = StateRoot::new(tx.tx_mut()).root().unwrap();
+        let tx = factory.provider_rw().unwrap();
+        let got = StateRoot::new(tx.tx_ref()).root().unwrap();
         assert_eq!(expected, got);
     }
 
@@ -836,9 +844,9 @@ mod tests {
             hashed_storage_cursor.upsert(key3, StorageEntry { key: hashed_slot, value }).unwrap();
         }
         tx.commit().unwrap();
-        let mut tx = factory.provider_rw().unwrap();
+        let tx = factory.provider_rw().unwrap();
 
-        let account3_storage_root = StorageRoot::new(tx.tx_mut(), address3).root().unwrap();
+        let account3_storage_root = StorageRoot::new(tx.tx_ref(), address3).root().unwrap();
         let expected_root = storage_root_prehashed(storage.into_iter());
         assert_eq!(expected_root, account3_storage_root);
     }
@@ -858,7 +866,7 @@ mod tests {
 
         let db = create_test_rw_db();
         let factory = ProviderFactory::new(db.as_ref(), MAINNET.clone());
-        let mut tx = factory.provider_rw().unwrap();
+        let tx = factory.provider_rw().unwrap();
 
         let mut hashed_account_cursor =
             tx.tx_ref().cursor_write::<tables::HashedAccount>().unwrap();
@@ -906,7 +914,7 @@ mod tests {
             }
             hashed_storage_cursor.upsert(key3, StorageEntry { key: hashed_slot, value }).unwrap();
         }
-        let account3_storage_root = StorageRoot::new(tx.tx_mut(), address3).root().unwrap();
+        let account3_storage_root = StorageRoot::new(tx.tx_ref(), address3).root().unwrap();
         hash_builder.add_leaf(
             Nibbles::unpack(key3),
             &encode_account(account3, Some(account3_storage_root)),
@@ -1013,7 +1021,7 @@ mod tests {
             Account { nonce: 0, balance: U256::from(5).mul(ether), bytecode_hash: None };
         hashed_account_cursor.upsert(key4b, account4b).unwrap();
 
-        let mut prefix_set = PrefixSet::default();
+        let mut prefix_set = PrefixSetMut::default();
         prefix_set.insert(Nibbles::unpack(key4b));
 
         let expected_state_root =
@@ -1021,7 +1029,7 @@ mod tests {
                 .unwrap();
 
         let (root, trie_updates) = StateRoot::new(tx.tx_ref())
-            .with_changed_account_prefixes(prefix_set)
+            .with_changed_account_prefixes(prefix_set.freeze())
             .root_with_updates()
             .unwrap();
         assert_eq!(root, expected_state_root);
@@ -1059,7 +1067,7 @@ mod tests {
             let account = hashed_account_cursor.seek_exact(key2).unwrap().unwrap();
             hashed_account_cursor.delete_current().unwrap();
 
-            let mut account_prefix_set = PrefixSet::default();
+            let mut account_prefix_set = PrefixSetMut::default();
             account_prefix_set.insert(Nibbles::unpack(account.0));
 
             let computed_expected_root: H256 = triehash::trie_root::<KeccakHasher, _, _, _>([
@@ -1073,7 +1081,7 @@ mod tests {
             ]);
 
             let (root, trie_updates) = StateRoot::new(tx.tx_ref())
-                .with_changed_account_prefixes(account_prefix_set)
+                .with_changed_account_prefixes(account_prefix_set.freeze())
                 .root_with_updates()
                 .unwrap();
             assert_eq!(root, computed_expected_root);
@@ -1105,7 +1113,7 @@ mod tests {
             drop(tx);
         }
 
-        let mut tx = factory.provider_rw().unwrap();
+        let tx = factory.provider_rw().unwrap();
         {
             let mut hashed_account_cursor =
                 tx.tx_ref().cursor_write::<tables::HashedAccount>().unwrap();
@@ -1115,7 +1123,7 @@ mod tests {
             let account3 = hashed_account_cursor.seek_exact(key3).unwrap().unwrap();
             hashed_account_cursor.delete_current().unwrap();
 
-            let mut account_prefix_set = PrefixSet::default();
+            let mut account_prefix_set = PrefixSetMut::default();
             account_prefix_set.insert(Nibbles::unpack(account2.0));
             account_prefix_set.insert(Nibbles::unpack(account3.0));
 
@@ -1129,8 +1137,8 @@ mod tests {
                 (key6, encode_account(account6, None)),
             ]);
 
-            let (root, trie_updates) = StateRoot::new(tx.tx_mut())
-                .with_changed_account_prefixes(account_prefix_set)
+            let (root, trie_updates) = StateRoot::new(tx.tx_ref())
+                .with_changed_account_prefixes(account_prefix_set.freeze())
                 .root_with_updates()
                 .unwrap();
             assert_eq!(root, computed_expected_root);
@@ -1165,11 +1173,11 @@ mod tests {
     fn account_trie_around_extension_node() {
         let db = create_test_rw_db();
         let factory = ProviderFactory::new(db.as_ref(), MAINNET.clone());
-        let mut tx = factory.provider_rw().unwrap();
+        let tx = factory.provider_rw().unwrap();
 
-        let expected = extension_node_trie(&mut tx);
+        let expected = extension_node_trie(&tx);
 
-        let (got, updates) = StateRoot::new(tx.tx_mut()).root_with_updates().unwrap();
+        let (got, updates) = StateRoot::new(tx.tx_ref()).root_with_updates().unwrap();
         assert_eq!(expected, got);
 
         // Check account trie
@@ -1191,13 +1199,13 @@ mod tests {
     fn account_trie_around_extension_node_with_dbtrie() {
         let db = create_test_rw_db();
         let factory = ProviderFactory::new(db.as_ref(), MAINNET.clone());
-        let mut tx = factory.provider_rw().unwrap();
+        let tx = factory.provider_rw().unwrap();
 
-        let expected = extension_node_trie(&mut tx);
+        let expected = extension_node_trie(&tx);
 
-        let (got, updates) = StateRoot::new(tx.tx_mut()).root_with_updates().unwrap();
+        let (got, updates) = StateRoot::new(tx.tx_ref()).root_with_updates().unwrap();
         assert_eq!(expected, got);
-        updates.flush(tx.tx_mut()).unwrap();
+        updates.flush(tx.tx_ref()).unwrap();
 
         // read the account updates from the db
         let mut accounts_trie = tx.tx_ref().cursor_read::<tables::AccountsTrie>().unwrap();
@@ -1211,21 +1219,22 @@ mod tests {
         assert_trie_updates(&account_updates);
     }
 
-    // TODO: limit the thumber of test cases?
     proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 128, ..ProptestConfig::default()
+        })]
         #[test]
         fn fuzz_state_root_incremental(account_changes: [BTreeMap<H256, U256>; 5]) {
             tokio::runtime::Runtime::new().unwrap().block_on(async {
-
                 let db = create_test_rw_db();
                 let factory = ProviderFactory::new(db.as_ref(), MAINNET.clone());
-                let mut tx = factory.provider_rw().unwrap();
+                let tx = factory.provider_rw().unwrap();
                 let mut hashed_account_cursor = tx.tx_ref().cursor_write::<tables::HashedAccount>().unwrap();
 
                 let mut state = BTreeMap::default();
                 for accounts in account_changes {
                     let should_generate_changeset = !state.is_empty();
-                    let mut changes = PrefixSet::default();
+                    let mut changes = PrefixSetMut::default();
                     for (hashed_address, balance) in accounts.clone() {
                         hashed_account_cursor.upsert(hashed_address, Account { balance,..Default::default() }).unwrap();
                         if should_generate_changeset {
@@ -1233,8 +1242,8 @@ mod tests {
                         }
                     }
 
-                    let (state_root, trie_updates) = StateRoot::new(tx.tx_mut())
-                        .with_changed_account_prefixes(changes)
+                    let (state_root, trie_updates) = StateRoot::new(tx.tx_ref())
+                        .with_changed_account_prefixes(changes.freeze())
                         .root_with_updates()
                         .unwrap();
 
@@ -1243,7 +1252,7 @@ mod tests {
                         state.clone().into_iter().map(|(key, balance)| (key, (Account { balance, ..Default::default() }, std::iter::empty())))
                     );
                     assert_eq!(expected_root, state_root);
-                    trie_updates.flush(tx.tx_mut()).unwrap();
+                    trie_updates.flush(tx.tx_ref()).unwrap();
                 }
             });
         }
@@ -1253,14 +1262,13 @@ mod tests {
     fn storage_trie_around_extension_node() {
         let db = create_test_rw_db();
         let factory = ProviderFactory::new(db.as_ref(), MAINNET.clone());
-        let mut tx = factory.provider_rw().unwrap();
+        let tx = factory.provider_rw().unwrap();
 
         let hashed_address = H256::random();
-        let (expected_root, expected_updates) =
-            extension_node_storage_trie(&mut tx, hashed_address);
+        let (expected_root, expected_updates) = extension_node_storage_trie(&tx, hashed_address);
 
         let (got, _, updates) =
-            StorageRoot::new_hashed(tx.tx_mut(), hashed_address).root_with_updates().unwrap();
+            StorageRoot::new_hashed(tx.tx_ref(), hashed_address).root_with_updates().unwrap();
         assert_eq!(expected_root, got);
 
         // Check account trie
@@ -1279,7 +1287,7 @@ mod tests {
     }
 
     fn extension_node_storage_trie(
-        tx: &mut DatabaseProviderRW<'_, &Env<WriteMap>>,
+        tx: &DatabaseProviderRW<'_, &DatabaseEnv>,
         hashed_address: H256,
     ) -> (H256, HashMap<Nibbles, BranchNodeCompact>) {
         let value = U256::from(1);
@@ -1305,7 +1313,7 @@ mod tests {
         (root, updates)
     }
 
-    fn extension_node_trie(tx: &mut DatabaseProviderRW<'_, &Env<WriteMap>>) -> H256 {
+    fn extension_node_trie(tx: &DatabaseProviderRW<'_, &DatabaseEnv>) -> H256 {
         let a =
             Account { nonce: 0, balance: U256::from(1u64), bytecode_hash: Some(H256::random()) };
         let val = encode_account(a, None);

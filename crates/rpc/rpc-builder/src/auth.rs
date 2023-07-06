@@ -1,7 +1,7 @@
 use crate::{
     constants,
     error::{RpcError, ServerKind},
-    eth::DEFAULT_MAX_LOGS_IN_RESPONSE,
+    eth::DEFAULT_MAX_LOGS_PER_RESPONSE,
 };
 use hyper::header::AUTHORIZATION;
 pub use jsonrpsee::server::ServerBuilder;
@@ -11,7 +11,7 @@ use jsonrpsee::{
 };
 use reth_network_api::{NetworkInfo, Peers};
 use reth_provider::{
-    BlockProviderIdExt, EvmEnvProvider, HeaderProvider, ReceiptProviderIdExt, StateProviderFactory,
+    BlockReaderIdExt, EvmEnvProvider, HeaderProvider, ReceiptProviderIdExt, StateProviderFactory,
 };
 use reth_rpc::{
     eth::{cache::EthStateCache, gas_oracle::GasPriceOracle},
@@ -38,7 +38,7 @@ pub async fn launch<Provider, Pool, Network, Tasks, EngineApi>(
     secret: JwtSecret,
 ) -> Result<AuthServerHandle, RpcError>
 where
-    Provider: BlockProviderIdExt
+    Provider: BlockReaderIdExt
         + ReceiptProviderIdExt
         + HeaderProvider
         + StateProviderFactory
@@ -67,7 +67,7 @@ where
         provider,
         pool,
         eth_cache.clone(),
-        DEFAULT_MAX_LOGS_IN_RESPONSE,
+        DEFAULT_MAX_LOGS_PER_RESPONSE,
         Box::new(executor.clone()),
     );
     launch_with_eth_api(eth_api, eth_filter, engine_api, socket_addr, secret).await
@@ -82,7 +82,7 @@ pub async fn launch_with_eth_api<Provider, Pool, Network, EngineApi>(
     secret: JwtSecret,
 ) -> Result<AuthServerHandle, RpcError>
 where
-    Provider: BlockProviderIdExt
+    Provider: BlockReaderIdExt
         + HeaderProvider
         + StateProviderFactory
         + EvmEnvProvider

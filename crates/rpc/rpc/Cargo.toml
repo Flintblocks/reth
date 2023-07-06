@@ -22,6 +22,8 @@ reth-network-api = { workspace = true, features = ["test-utils"] }
 reth-rpc-engine-api = { path = "../rpc-engine-api" }
 reth-revm = { path = "../../revm" }
 reth-tasks = { workspace = true }
+reth-metrics = { workspace = true }
+reth-consensus-common = { path = "../../consensus/common" }
 
 # eth
 revm = { workspace = true, features = [
@@ -63,3 +65,4 @@ futures = { workspace = true }
 jsonrpsee = { version = "0.18", features = ["client"] }
 assert_matches = "1.5.0"
 tempfile = "3.5.0"
+reth-interfaces = { workspace = true, features = ["test-utils"] }

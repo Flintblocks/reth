@@ -3,15 +3,12 @@
 use futures::{future::Either, Stream, StreamExt};
 use reth_interfaces::{provider::ProviderError, Result};
 use reth_primitives::{Block, Receipt, SealedBlock, TransactionSigned, H256};
-use reth_provider::{BlockProvider, CanonStateNotification, EvmEnvProvider, StateProviderFactory};
+use reth_provider::{BlockReader, CanonStateNotification, EvmEnvProvider, StateProviderFactory};
 use reth_tasks::{TaskSpawner, TokioTaskExecutor};
 use revm::primitives::{BlockEnv, CfgEnv};
-use schnellru::{ByMemoryUsage, Limiter, LruMap};
-use serde::{Deserialize, Serialize};
+use schnellru::{ByLength, Limiter};
 use std::{
-    collections::{hash_map::Entry, HashMap},
     future::Future,
-    hash::Hash,
     pin::Pin,
     task::{ready, Context, Poll},
 };
@@ -21,16 +18,13 @@ use tokio::sync::{
 };
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
-/// Default cache size for the block cache: 500MB
-///
-/// With an average block size of ~100kb this should be able to cache ~5000 blocks.
-pub const DEFAULT_BLOCK_CACHE_SIZE_BYTES_MB: usize = 500;
+mod config;
+pub use config::*;
 
-/// Default cache size for the receipts cache: 500MB
-pub const DEFAULT_RECEIPT_CACHE_SIZE_BYTES_MB: usize = 500;
+mod metrics;
 
-/// Default cache size for the env cache: 1MB
-pub const DEFAULT_ENV_CACHE_SIZE_BYTES_MB: usize = 1;
+mod multi_consumer;
+pub use multi_consumer::MultiConsumerLruCache;
 
 /// The type that can send the response to a requested [Block]
 type BlockResponseSender = oneshot::Sender<Result<Option<Block>>>;
@@ -55,34 +49,6 @@ type ReceiptsLruCache<L> = MultiConsumerLruCache<H256, Vec<Receipt>, L, Receipts
 
 type EnvLruCache<L> = MultiConsumerLruCache<H256, (CfgEnv, BlockEnv), L, EnvResponseSender>;
 
-/// Settings for the [EthStateCache]
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct EthStateCacheConfig {
-    /// Max number of bytes for cached block data.
-    ///
-    /// Default is 500MB
-    pub max_block_bytes: usize,
-    /// Max number of bytes for cached receipt data.
-    ///
-    /// Default is 500MB
-    pub max_receipt_bytes: usize,
-    /// Max number of bytes for cached env data.
-    ///
-    /// Default is 1MB (env configs are very small)
-    pub max_env_bytes: usize,
-}
-
-impl Default for EthStateCacheConfig {
-    fn default() -> Self {
-        Self {
-            max_block_bytes: DEFAULT_BLOCK_CACHE_SIZE_BYTES_MB * 1024 * 1024,
-            max_receipt_bytes: DEFAULT_RECEIPT_CACHE_SIZE_BYTES_MB * 1024 * 1024,
-            max_env_bytes: DEFAULT_ENV_CACHE_SIZE_BYTES_MB * 1024 * 1024,
-        }
-    }
-}
-
 /// Provides async access to cached eth data
 ///
 /// This is the frontend for the async caching service which manages cached data on a different
@@ -97,16 +63,16 @@ impl EthStateCache {
     fn create<Provider, Tasks>(
         provider: Provider,
         action_task_spawner: Tasks,
-        max_block_bytes: usize,
-        max_receipt_bytes: usize,
-        max_env_bytes: usize,
+        max_blocks: u32,
+        max_receipts: u32,
+        max_envs: u32,
     ) -> (Self, EthStateCacheService<Provider, Tasks>) {
         let (to_service, rx) = unbounded_channel();
         let service = EthStateCacheService {
             provider,
-            full_block_cache: BlockLruCache::with_memory_budget(max_block_bytes),
-            receipts_cache: ReceiptsLruCache::with_memory_budget(max_receipt_bytes),
-            evm_env_cache: EnvLruCache::with_memory_budget(max_env_bytes),
+            full_block_cache: BlockLruCache::new(max_blocks, "blocks"),
+            receipts_cache: ReceiptsLruCache::new(max_receipts, "receipts"),
+            evm_env_cache: EnvLruCache::new(max_envs, "evm_env"),
             action_tx: to_service.clone(),
             action_rx: UnboundedReceiverStream::new(rx),
             action_task_spawner,
@@ -121,7 +87,7 @@ impl EthStateCache {
     /// See also [Self::spawn_with]
     pub fn spawn<Provider>(provider: Provider, config: EthStateCacheConfig) -> Self
     where
-        Provider: StateProviderFactory + BlockProvider + EvmEnvProvider + Clone + Unpin + 'static,
+        Provider: StateProviderFactory + BlockReader + EvmEnvProvider + Clone + Unpin + 'static,
     {
         Self::spawn_with(provider, config, TokioTaskExecutor::default())
     }
@@ -136,17 +102,12 @@ impl EthStateCache {
         executor: Tasks,
     ) -> Self
     where
-        Provider: StateProviderFactory + BlockProvider + EvmEnvProvider + Clone + Unpin + 'static,
+        Provider: StateProviderFactory + BlockReader + EvmEnvProvider + Clone + Unpin + 'static,
         Tasks: TaskSpawner + Clone + 'static,
     {
-        let EthStateCacheConfig { max_block_bytes, max_receipt_bytes, max_env_bytes } = config;
-        let (this, service) = Self::create(
-            provider,
-            executor.clone(),
-            max_block_bytes,
-            max_receipt_bytes,
-            max_env_bytes,
-        );
+        let EthStateCacheConfig { max_blocks, max_receipts, max_envs } = config;
+        let (this, service) =
+            Self::create(provider, executor.clone(), max_blocks, max_receipts, max_envs);
         executor.spawn_critical("eth state cache", Box::pin(service));
         this
     }
@@ -179,6 +140,19 @@ impl EthStateCache {
         rx.await.map_err(|_| ProviderError::CacheServiceUnavailable)?
     }
 
+    /// Fetches both transactions and receipts for the given block hash.
+    pub(crate) async fn get_transactions_and_receipts(
+        &self,
+        block_hash: H256,
+    ) -> Result<Option<(Vec<TransactionSigned>, Vec<Receipt>)>> {
+        let transactions = self.get_block_transactions(block_hash);
+        let receipts = self.get_receipts(block_hash);
+
+        let (transactions, receipts) = futures::try_join!(transactions, receipts)?;
+
+        Ok(transactions.zip(receipts))
+    }
+
     /// Requests the [Receipt] for the block hash
     ///
     /// Returns `None` if the block was not found.
@@ -186,6 +160,19 @@ impl EthStateCache {
         let (response_tx, rx) = oneshot::channel();
         let _ = self.to_service.send(CacheAction::GetReceipts { block_hash, response_tx });
         rx.await.map_err(|_| ProviderError::CacheServiceUnavailable)?
+    }
+
+    /// Fetches both receipts and block for the given block hash.
+    pub(crate) async fn get_block_and_receipts(
+        &self,
+        block_hash: H256,
+    ) -> Result<Option<(SealedBlock, Vec<Receipt>)>> {
+        let block = self.get_sealed_block(block_hash);
+        let receipts = self.get_receipts(block_hash);
+
+        let (block, receipts) = futures::try_join!(block, receipts)?;
+
+        Ok(block.zip(receipts))
     }
 
     /// Requests the evm env config for the block hash.
@@ -218,9 +205,9 @@ impl EthStateCache {
 pub(crate) struct EthStateCacheService<
     Provider,
     Tasks,
-    LimitBlocks = ByMemoryUsage,
-    LimitReceipts = ByMemoryUsage,
-    LimitEnvs = ByMemoryUsage,
+    LimitBlocks = ByLength,
+    LimitReceipts = ByLength,
+    LimitEnvs = ByLength,
 > where
     LimitBlocks: Limiter<H256, Block>,
     LimitReceipts: Limiter<H256, Vec<Receipt>>,
@@ -244,11 +231,11 @@ pub(crate) struct EthStateCacheService<
 
 impl<Provider, Tasks> EthStateCacheService<Provider, Tasks>
 where
-    Provider: StateProviderFactory + BlockProvider + EvmEnvProvider + Clone + Unpin + 'static,
+    Provider: StateProviderFactory + BlockReader + EvmEnvProvider + Clone + Unpin + 'static,
     Tasks: TaskSpawner + Clone + 'static,
 {
     fn on_new_block(&mut self, block_hash: H256, res: Result<Option<Block>>) {
-        if let Some(queued) = self.full_block_cache.queued.remove(&block_hash) {
+        if let Some(queued) = self.full_block_cache.remove(&block_hash) {
             // send the response to queued senders
             for tx in queued {
                 match tx {
@@ -266,12 +253,12 @@ where
 
         // cache good block
         if let Ok(Some(block)) = res {
-            self.full_block_cache.cache.insert(block_hash, block);
+            self.full_block_cache.insert(block_hash, block);
         }
     }
 
     fn on_new_receipts(&mut self, block_hash: H256, res: Result<Option<Vec<Receipt>>>) {
-        if let Some(queued) = self.receipts_cache.queued.remove(&block_hash) {
+        if let Some(queued) = self.receipts_cache.remove(&block_hash) {
             // send the response to queued senders
             for tx in queued {
                 let _ = tx.send(res.clone());
@@ -280,14 +267,20 @@ where
 
         // cache good receipts
         if let Ok(Some(receipts)) = res {
-            self.receipts_cache.cache.insert(block_hash, receipts);
+            self.receipts_cache.insert(block_hash, receipts);
         }
+    }
+
+    fn update_cached_metrics(&self) {
+        self.full_block_cache.update_cached_metrics();
+        self.receipts_cache.update_cached_metrics();
+        self.evm_env_cache.update_cached_metrics();
     }
 }
 
 impl<Provider, Tasks> Future for EthStateCacheService<Provider, Tasks>
 where
-    Provider: StateProviderFactory + BlockProvider + EvmEnvProvider + Clone + Unpin + 'static,
+    Provider: StateProviderFactory + BlockReader + EvmEnvProvider + Clone + Unpin + 'static,
     Tasks: TaskSpawner + Clone + 'static,
 {
     type Output = ();
@@ -304,9 +297,7 @@ where
                     match action {
                         CacheAction::GetBlock { block_hash, response_tx } => {
                             // check if block is cached
-                            if let Some(block) =
-                                this.full_block_cache.cache.get(&block_hash).cloned()
-                            {
+                            if let Some(block) = this.full_block_cache.get(&block_hash).cloned() {
                                 let _ = response_tx.send(Ok(Some(block)));
                                 continue
                             }
@@ -324,7 +315,7 @@ where
                         }
                         CacheAction::GetBlockTransactions { block_hash, response_tx } => {
                             // check if block is cached
-                            if let Some(block) = this.full_block_cache.cache.get(&block_hash) {
+                            if let Some(block) = this.full_block_cache.get(&block_hash) {
                                 let _ = response_tx.send(Ok(Some(block.body.clone())));
                                 continue
                             }
@@ -342,9 +333,7 @@ where
                         }
                         CacheAction::GetReceipts { block_hash, response_tx } => {
                             // check if block is cached
-                            if let Some(receipts) =
-                                this.receipts_cache.cache.get(&block_hash).cloned()
-                            {
+                            if let Some(receipts) = this.receipts_cache.get(&block_hash).cloned() {
                                 let _ = response_tx.send(Ok(Some(receipts)));
                                 continue
                             }
@@ -362,7 +351,7 @@ where
                         }
                         CacheAction::GetEnv { block_hash, response_tx } => {
                             // check if env data is cached
-                            if let Some(env) = this.evm_env_cache.cache.get(&block_hash).cloned() {
+                            if let Some(env) = this.evm_env_cache.get(&block_hash).cloned() {
                                 let _ = response_tx.send(Ok(env));
                                 continue
                             }
@@ -393,7 +382,7 @@ where
                         }
                         CacheAction::EnvResult { block_hash, res } => {
                             let res = *res;
-                            if let Some(queued) = this.evm_env_cache.queued.remove(&block_hash) {
+                            if let Some(queued) = this.evm_env_cache.remove(&block_hash) {
                                 // send the response to queued senders
                                 for tx in queued {
                                     let _ = tx.send(res.clone());
@@ -402,7 +391,7 @@ where
 
                             // cache good env data
                             if let Ok(data) = res {
-                                this.evm_env_cache.cache.insert(block_hash, data);
+                                this.evm_env_cache.insert(block_hash, data);
                             }
                         }
                         CacheAction::CacheNewCanonicalChain { blocks, receipts } => {
@@ -417,55 +406,11 @@ where
                                 );
                             }
                         }
-                    }
+                    };
+                    this.update_cached_metrics();
                 }
             }
         }
-    }
-}
-
-struct MultiConsumerLruCache<K, V, L, S>
-where
-    K: Hash + Eq,
-    L: Limiter<K, V>,
-{
-    /// The LRU cache for the
-    cache: LruMap<K, V, L>,
-    /// All queued consumers
-    queued: HashMap<K, Vec<S>>,
-}
-
-impl<K, V, L, S> MultiConsumerLruCache<K, V, L, S>
-where
-    K: Hash + Eq,
-    L: Limiter<K, V>,
-{
-    /// Adds the sender to the queue for the given key.
-    ///
-    /// Returns true if this is the first queued sender for the key
-    fn queue(&mut self, key: K, sender: S) -> bool {
-        match self.queued.entry(key) {
-            Entry::Occupied(mut entry) => {
-                entry.get_mut().push(sender);
-                false
-            }
-            Entry::Vacant(entry) => {
-                entry.insert(vec![sender]);
-                true
-            }
-        }
-    }
-}
-
-impl<K, V, S> MultiConsumerLruCache<K, V, ByMemoryUsage, S>
-where
-    K: Hash + Eq,
-{
-    /// Creates a new empty map with a given `memory_budget`.
-    ///
-    /// See also [LruMap::with_memory_budget]
-    fn with_memory_budget(memory_budget: usize) -> Self {
-        Self { cache: LruMap::with_memory_budget(memory_budget), queued: Default::default() }
     }
 }
 

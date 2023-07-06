@@ -229,7 +229,7 @@ where
 
         let mut cumulative_gas_used = 0;
         let mut post_state = PostState::with_tx_capacity(block.number, block.body.len());
-        for (transaction, sender) in block.body.iter().zip(senders.into_iter()) {
+        for (transaction, sender) in block.body.iter().zip(senders) {
             // The sum of the transaction’s gas limit, Tg, and the gas utilised in this block prior,
             // must be no greater than the block’s gasLimit.
             let block_available_gas = block.header.gas_limit - cumulative_gas_used;
@@ -654,7 +654,7 @@ mod tests {
     };
     use reth_provider::{
         post_state::{AccountChanges, Storage, StorageTransition, StorageWipe},
-        AccountReader, BlockHashProvider, StateProvider, StateRootProvider,
+        AccountReader, BlockHashReader, StateProvider, StateRootProvider,
     };
     use reth_rlp::Decodable;
     use std::{collections::HashMap, str::FromStr};
@@ -700,7 +700,7 @@ mod tests {
         }
     }
 
-    impl BlockHashProvider for StateProviderTest {
+    impl BlockHashReader for StateProviderTest {
         fn block_hash(&self, number: u64) -> reth_interfaces::Result<Option<H256>> {
             Ok(self.block_hash.get(&number).cloned())
         }

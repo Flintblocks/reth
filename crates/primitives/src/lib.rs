@@ -1,3 +1,9 @@
+#![cfg_attr(docsrs, feature(doc_cfg))]
+#![doc(
+    html_logo_url = "https://raw.githubusercontent.com/paradigmxyz/reth/main/assets/reth-docs.png",
+    html_favicon_url = "https://avatars0.githubusercontent.com/u/97369466?s=256",
+    issue_tracker_base_url = "https://github.com/paradigmxzy/reth/issues/"
+)]
 #![warn(missing_debug_implementations, missing_docs, unreachable_pub)]
 #![deny(unused_must_use, rust_2018_idioms)]
 #![doc(test(
@@ -24,6 +30,7 @@ mod compression;
 pub mod constants;
 pub mod contract;
 mod forkid;
+pub mod fs;
 mod genesis;
 mod hardfork;
 mod header;
@@ -33,6 +40,7 @@ pub mod listener;
 mod log;
 mod net;
 mod peer;
+mod prune;
 mod receipt;
 pub mod stage;
 mod storage;
@@ -46,8 +54,8 @@ pub mod proofs;
 pub use account::{Account, Bytecode};
 pub use bits::H512;
 pub use block::{
-    Block, BlockBody, BlockHashOrNumber, BlockId, BlockNumHash, BlockNumberOrTag, BlockWithSenders,
-    ForkBlock, SealedBlock, SealedBlockWithSenders,
+    Block, BlockBody, BlockBodyRoots, BlockHashOrNumber, BlockId, BlockNumHash, BlockNumberOrTag,
+    BlockWithSenders, ForkBlock, SealedBlock, SealedBlockWithSenders,
 };
 pub use bloom::Bloom;
 pub use chain::{
@@ -70,6 +78,7 @@ pub use net::{
     SEPOLIA_BOOTNODES,
 };
 pub use peer::{PeerId, WithPeerId};
+pub use prune::{PruneCheckpoint, PruneMode};
 pub use receipt::{Receipt, ReceiptWithBloom, ReceiptWithBloomRef};
 pub use revm_primitives::JumpMap;
 pub use serde_helper::JsonU256;
@@ -107,7 +116,6 @@ pub type StorageValue = U256;
 pub type Selector = [u8; 4];
 
 pub use ethers_core::{
-    types as rpc,
     types::{BigEndianHash, H128, H64, U64},
     utils as rpc_utils,
 };

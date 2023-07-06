@@ -172,8 +172,23 @@ pub trait BlockchainTreeViewer: Send + Sync {
 
     /// Returns the block with matching hash from the tree, if it exists.
     ///
-    /// Caution: This will not return blocks from the canonical chain.
+    /// Caution: This will not return blocks from the canonical chain or buffered blocks that are
+    /// disconnected from the canonical chain.
     fn block_by_hash(&self, hash: BlockHash) -> Option<SealedBlock>;
+
+    /// Returns the _buffered_ (disconnected) block with matching hash from the internal buffer if
+    /// it exists.
+    ///
+    /// Caution: Unlike [Self::block_by_hash] this will only return blocks that are currently
+    /// disconnected from the canonical chain.
+    fn buffered_block_by_hash(&self, block_hash: BlockHash) -> Option<SealedBlock>;
+
+    /// Returns the _buffered_ (disconnected) header with matching hash from the internal buffer if
+    /// it exists.
+    ///
+    /// Caution: Unlike [Self::block_by_hash] this will only return headers that are currently
+    /// disconnected from the canonical chain.
+    fn buffered_header_by_hash(&self, block_hash: BlockHash) -> Option<SealedHeader>;
 
     /// Returns true if the tree contains the block with matching hash.
     fn contains(&self, hash: BlockHash) -> bool {
@@ -215,6 +230,12 @@ pub trait BlockchainTreeViewer: Send + Sync {
     fn pending_block(&self) -> Option<SealedBlock> {
         self.block_by_hash(self.pending_block_num_hash()?.hash)
     }
+
+    /// Returns the pending block and its receipts in one call.
+    ///
+    /// This exists to prevent a potential data race if the pending block changes in between
+    /// [Self::pending_block] and [Self::pending_receipts] calls.
+    fn pending_block_and_receipts(&self) -> Option<(SealedBlock, Vec<Receipt>)>;
 
     /// Returns the pending receipts if there is one.
     fn pending_receipts(&self) -> Option<Vec<Receipt>> {

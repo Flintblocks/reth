@@ -1,6 +1,6 @@
 //! Database debugging tool
 use crate::{
-    args::utils::genesis_value_parser,
+    args::{utils::genesis_value_parser, DatabaseArgs},
     dirs::{DataDirPath, MaybePlatformPath},
     utils::DbTool,
 };
@@ -10,11 +10,11 @@ use eyre::WrapErr;
 use human_bytes::human_bytes;
 use reth_db::{
     database::Database,
+    open_db, open_db_read_only,
     version::{get_db_version, DatabaseVersionError, DB_VERSION},
     Tables,
 };
 use reth_primitives::ChainSpec;
-use reth_staged_sync::utils::init::init_db;
 use std::sync::Arc;
 
 mod get;
@@ -53,6 +53,9 @@ pub struct Command {
     )]
     chain: Arc<ChainSpec>,
 
+    #[clap(flatten)]
+    db: DatabaseArgs,
+
     #[clap(subcommand)]
     command: Subcommands,
 }
@@ -81,13 +84,11 @@ impl Command {
         let data_dir = self.datadir.unwrap_or_chain_default(self.chain.chain);
         let db_path = data_dir.db_path();
 
-        let db = init_db(&db_path)?;
-
-        let mut tool = DbTool::new(&db, self.chain.clone())?;
-
         match self.command {
             // TODO: We'll need to add this on the DB trait.
             Subcommands::Stats { .. } => {
+                let db = open_db_read_only(&db_path, self.db.log_level)?;
+                let tool = DbTool::new(&db, self.chain.clone())?;
                 let mut stats_table = ComfyTable::new();
                 stats_table.load_preset(comfy_table::presets::ASCII_MARKDOWN);
                 stats_table.set_header([
@@ -137,12 +138,18 @@ impl Command {
                 println!("{stats_table}");
             }
             Subcommands::List(command) => {
+                let db = open_db_read_only(&db_path, self.db.log_level)?;
+                let tool = DbTool::new(&db, self.chain.clone())?;
                 command.execute(&tool)?;
             }
             Subcommands::Get(command) => {
+                let db = open_db_read_only(&db_path, self.db.log_level)?;
+                let tool = DbTool::new(&db, self.chain.clone())?;
                 command.execute(&tool)?;
             }
             Subcommands::Drop => {
+                let db = open_db(&db_path, self.db.log_level)?;
+                let mut tool = DbTool::new(&db, self.chain.clone())?;
                 tool.drop(db_path)?;
             }
             Subcommands::Version => {

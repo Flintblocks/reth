@@ -1,7 +1,7 @@
 use crate::{
     traits::{BlockSource, ReceiptProvider},
-    AccountReader, BlockHashProvider, BlockIdProvider, BlockNumProvider, BlockProvider,
-    BlockProviderIdExt, EvmEnvProvider, HeaderProvider, PostState, ReceiptProviderIdExt,
+    AccountReader, BlockHashReader, BlockIdReader, BlockNumReader, BlockReader, BlockReaderIdExt,
+    ChainSpecProvider, EvmEnvProvider, HeaderProvider, PostState, ReceiptProviderIdExt,
     StageCheckpointReader, StateProvider, StateProviderBox, StateProviderFactory,
     StateRootProvider, TransactionsProvider, WithdrawalsProvider,
 };
@@ -10,19 +10,25 @@ use reth_interfaces::Result;
 use reth_primitives::{
     stage::{StageCheckpoint, StageId},
     Account, Address, Block, BlockHash, BlockHashOrNumber, BlockId, BlockNumber, Bytecode, Bytes,
-    ChainInfo, Header, Receipt, SealedBlock, SealedHeader, StorageKey, StorageValue,
-    TransactionMeta, TransactionSigned, TxHash, TxNumber, H256, KECCAK_EMPTY, U256,
+    ChainInfo, ChainSpec, Header, Receipt, SealedBlock, SealedHeader, StorageKey, StorageValue,
+    TransactionMeta, TransactionSigned, TxHash, TxNumber, H256, KECCAK_EMPTY, MAINNET, U256,
 };
 use reth_revm_primitives::primitives::{BlockEnv, CfgEnv};
-use std::ops::RangeBounds;
+use std::{ops::RangeBounds, sync::Arc};
 
 /// Supports various api interfaces for testing purposes.
 #[derive(Debug, Clone, Default, Copy)]
 #[non_exhaustive]
 pub struct NoopProvider;
 
+impl ChainSpecProvider for NoopProvider {
+    fn chain_spec(&self) -> Arc<ChainSpec> {
+        MAINNET.clone()
+    }
+}
+
 /// Noop implementation for testing purposes
-impl BlockHashProvider for NoopProvider {
+impl BlockHashReader for NoopProvider {
     fn block_hash(&self, _number: u64) -> Result<Option<H256>> {
         Ok(None)
     }
@@ -32,7 +38,7 @@ impl BlockHashProvider for NoopProvider {
     }
 }
 
-impl BlockNumProvider for NoopProvider {
+impl BlockNumReader for NoopProvider {
     fn chain_info(&self) -> Result<ChainInfo> {
         Ok(ChainInfo::default())
     }
@@ -50,7 +56,7 @@ impl BlockNumProvider for NoopProvider {
     }
 }
 
-impl BlockProvider for NoopProvider {
+impl BlockReader for NoopProvider {
     fn find_block_by_hash(&self, hash: H256, _source: BlockSource) -> Result<Option<Block>> {
         self.block(hash.into())
     }
@@ -60,6 +66,10 @@ impl BlockProvider for NoopProvider {
     }
 
     fn pending_block(&self) -> Result<Option<SealedBlock>> {
+        Ok(None)
+    }
+
+    fn pending_block_and_receipts(&self) -> Result<Option<(SealedBlock, Vec<Receipt>)>> {
         Ok(None)
     }
 
@@ -79,7 +89,7 @@ impl BlockProvider for NoopProvider {
     }
 }
 
-impl BlockProviderIdExt for NoopProvider {
+impl BlockReaderIdExt for NoopProvider {
     fn block_by_id(&self, _id: BlockId) -> Result<Option<Block>> {
         Ok(None)
     }
@@ -97,7 +107,7 @@ impl BlockProviderIdExt for NoopProvider {
     }
 }
 
-impl BlockIdProvider for NoopProvider {
+impl BlockIdReader for NoopProvider {
     fn pending_block_num_hash(&self) -> Result<Option<reth_primitives::BlockNumHash>> {
         Ok(None)
     }
